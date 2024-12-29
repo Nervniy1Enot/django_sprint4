@@ -1,58 +1,85 @@
-from typing import List, Sequence, Dict, Optional
+import re
+from typing import Tuple
 
-from bs4 import BeautifulSoup
-from bs4.element import Tag, SoupStrainer
+from django.http import HttpResponse
 
+from adapters.post import PostModelAdapter
+from fixtures.types import CommentModelAdapterT
+from form.find_urls import find_links_between_lines, get_url_display_names
 from conftest import KeyVal
 
 
-def find_links_between_lines(
-    page_content: str,
-    urls_start_with: str,
-    start_lineix: int,
-    end_lineix: int,
-    link_text_in: Optional[str] = None,
-) -> List[Tag]:
-    if not link_text_in:
-        link_text_in = "\n".join(
-            page_content.split("\n")[
-                (start_lineix if start_lineix >= 0 else 0): (
-                    end_lineix if end_lineix >= 0 else None
-                )
-            ]
-        )
-    result_links = []
-    link_soup = BeautifulSoup(
-        page_content, features="html.parser", parse_only=SoupStrainer("a")
+def find_edit_and_delete_urls(
+    post_adapter: PostModelAdapter,
+    comment_adapter: CommentModelAdapterT,
+    post_page_response: HttpResponse,
+    urls_start_with: KeyVal,
+) -> Tuple[KeyVal, KeyVal]:
+    """Looks up two links in the post_page_response's content.
+    The links must be found between the post's text and the first
+    comment to the post.
+    The one with the word `edit` in it is for editing the post,
+    the other one, therefore, is for its deletion.
+    !!! Make posts and comments have unique texts and titles.
+    """
+
+    post_page_content = post_page_response.content.decode("utf-8")
+
+    links_not_found_err_msg = (
+        "Убедитесь, что на странице поста отображаются комментарии к нему."
+        " Проверьте, что автору поста доступны ссылки для редактирования и"
+        " для удаления этого поста. Адрес ссылок должен начинаться с"
+        f" {urls_start_with.key}"
     )
-    link: Tag
-    for link in link_soup:
-        if (
-            link.get("href")
-            and (
-                link.text in link_text_in
-                and link.get("href").startswith(urls_start_with)
-            )
-            and (link.sourceline >= start_lineix or start_lineix < 0)
-            and (link.sourceline <= end_lineix or end_lineix < 0)
-        ):
-            result_links.append(link)
-    return result_links
 
+    # Get info about html between two consecutive posts
+    displayed_post_text = post_adapter.displayed_field_name_or_value
+    displayed_comment_text = comment_adapter.displayed_field_name_or_value
+    pattern = re.compile(
+        rf"{displayed_post_text}([\w\W]*?){displayed_comment_text}"
+    )
+    between_posts_match = pattern.search(post_page_content)
+    assert between_posts_match, links_not_found_err_msg
+    text_between_posts = between_posts_match.group(1)
+    between_posts_start_lineix = post_page_content.count(
+        "\n", 0, between_posts_match.start()
+    )
+    between_posts_end_lineix = between_posts_start_lineix + (
+        between_posts_match.group().count("\n")
+    )
 
-def get_url_display_names(
-    urls_start_with: KeyVal, item_id: int, link_tags: Sequence[Tag]
-) -> Dict[str, str]:
-    """Map urls to their generic form (e.g.
-    /post/<post_id>/comment_edit/<comment_id>/)"""
-    result = {}
+    post_links = find_links_between_lines(
+        post_page_content,
+        urls_start_with.val,
+        between_posts_start_lineix,
+        between_posts_end_lineix,
+        link_text_in=text_between_posts,
+    )
+    if len(set(link.get("href") for link in post_links)) != 2:
+        raise AssertionError(links_not_found_err_msg)
 
-    def get_url_template(url: str) -> str:
-        return url.replace(urls_start_with.val, urls_start_with.key).replace(
-            f"{item_id}", "<comment_id>"
+    # We have two links. Which one of them is the edit link,
+    # and which - the delete link? Edit link must lead to a form.
+
+    edit_link, del_link = post_links[0], post_links[1]
+    if "edit" in edit_link.get("href"):
+        assert "edit" not in del_link.get(
+            "href"
+        ), "Убедитесь, что в адресе страницы удаления поста нет слова `edit`."
+    elif "edit" in del_link.get("href"):
+        edit_link, del_link = del_link, edit_link
+    else:
+        raise AssertionError(
+            "Убедитесь, что адрес страницы редактирования поста"
+            " -`posts/<post_id>/edit/`."
         )
 
-    for i in range(len(link_tags)):
-        url = link_tags[i].get("href")
-        result[url] = get_url_template(url)
-    return result
+    post_url_display_names = get_url_display_names(
+        urls_start_with, post_adapter.id, post_links
+    )
+    edit_url = edit_link.get("href")
+    del_url = del_link.get("href")
+    return (
+        KeyVal(key=edit_url, val=post_url_display_names[edit_url]),
+        KeyVal(key=del_url, val=post_url_display_names[del_url]),
+    )
